@@ -72,3 +72,73 @@ The standard defines a set of pins for the Test Access Port:
 * **Board Bring-up & Debug:** Verifying connections, diagnosing faults.
 * **In-System Programming:** Loading firmware/bitstreams into FPGAs, CPLDs, MCUs, Flash.
 * **CPU Debug:** Low-level hardware debugging access.
+
+
+## 9. Deeper Dive: The TAP Controller State Machine
+
+The heart of JTAG is the 16-state **TAP (Test Access Port) Controller** Finite State Machine (FSM). Its transitions are controlled solely by the value of `TMS` sampled on the rising edge of `TCK`. Understanding its flow is key to understanding JTAG operations.
+
+Here's a conceptual breakdown:
+
+* **Reset Path:**
+    * `Test-Logic-Reset`: The starting state (and reset state). Holding `TMS` HIGH for 5+ TCK cycles forces the controller here.
+* **Idle Path:**
+    * `Run-Test/Idle`: A stable state where the chip's normal logic can operate (or just idle). JTAG logic is inactive. From here, `TMS=1` starts a sequence to access registers.
+* **Data Register (DR) Scan Path:** (Used for BSR, IDCODE, BYPASS etc.)
+    * `Select-DR-Scan`: Decision point (`TMS=0` -> Capture-DR, `TMS=1` -> Select-IR-Scan).
+    * `Capture-DR`: Parallel loads data into the selected DR (e.g., captures pin states into BSR if SAMPLE/EXTEST is active). Moves to Shift-DR or Exit1-DR.
+    * `Shift-DR`: Shifts data serially one bit per TCK cycle from `TDI` through the selected DR to `TDO`. `TMS=0` keeps it here; `TMS=1` moves to Exit1-DR. **This is where data is actually shifted in/out.**
+    * `Pause-DR`: Can temporarily pause shifting (`TMS=0` stays here, `TMS=1` moves to Exit2-DR).
+    * `Exit1-DR` & `Exit2-DR`: Intermediate states for navigating out of the shift/pause loop.
+    * `Update-DR`: Latches the data shifted into the DR onto parallel outputs (e.g., makes the BSR drive the pins if EXTEST is active). Moves back to Run-Test/Idle or Select-DR-Scan.
+* **Instruction Register (IR) Scan Path:** (Used to load JTAG instructions)
+    * `Select-IR-Scan`: Decision point (`TMS=0` -> Capture-IR, `TMS=1` -> Test-Logic-Reset). Reached from Select-DR-Scan via `TMS=1`.
+    * `Capture-IR`: Parallel loads a fixed pattern (usually `...001`) into the IR shift register. Moves to Shift-IR or Exit1-IR.
+    * `Shift-IR`: Shifts instruction data serially from `TDI` through the IR to `TDO`. `TMS=0` keeps it here; `TMS=1` moves to Exit1-IR. **This is where new instructions are loaded.**
+    * `Pause-IR`: Can temporarily pause shifting.
+    * `Exit1-IR` & `Exit2-IR`: Intermediate states.
+    * `Update-IR`: Latches the new instruction from the IR shift register into the instruction holding register, making it the active instruction. Selects the corresponding DR. Moves back to Run-Test/Idle or Select-DR-Scan.
+
+*Navigation Strategy:* The external JTAG controller drives `TMS` and `TCK` precisely to navigate this state machine to perform the desired operations (select IR/DR, shift data, update outputs).
+
+## 10. More Common JTAG Instructions
+
+Besides the mandatory `EXTEST`, `SAMPLE/PRELOAD`, and `BYPASS`, other frequently encountered (often optional but standard) instructions include:
+
+* **`IDCODE`:** Selects the device Identification Register (IDCODE Register) as the DR. When data is shifted out (`Shift-DR` state), the chip's 32-bit unique ID (Manufacturer ID, Part Number, Version) is output on `TDO`. Allows tools to automatically identify devices in the chain.
+* **`USERCODE`:** Similar to `IDCODE`, but selects a user-defined code register. Often used to read back programming status or other custom information.
+* **`INTEST` (Internal Test):** Selects the BSR. Allows driving test data *from* the BSR *into* the chip's core logic and capturing the core logic's response back *into* the BSR. Used for testing the chip's internal functionality via the boundary scan cells.
+* **`RUNBIST` (Run Built-In Self-Test):** Selects a DR (often just BYPASS). This instruction triggers the execution of the chip's internal self-test sequences (like Memory BIST). The TAP controller usually goes to `Run-Test/Idle` while BIST runs. Results are typically read out later via another JTAG access or status pins.
+* **`CLAMP`:** Selects the BYPASS register. Drives the values previously loaded into the BSR output cells onto the chip's pins (similar to `EXTEST`) but disconnects the BSR from `TDI`/`TDO`. Useful for holding the outputs of one chip stable (quieting the bus) while testing another chip in the chain.
+
+## 11. BSDL (Boundary Scan Description Language) File Details
+
+BSDL is crucial for any tool that needs to control a device via JTAG. Key information found in a BSDL file (`.bsd` or `.bsdl` extension):
+
+* **Entity Declaration:** Names the device the BSDL file describes.
+* **Generic Parameter:** Often specifies the package type.
+* **Port Description:** Lists all the physical pins of the device.
+* **Pin Mapping:** Connects the physical pins to their logical signals and port types (input, output, bidirectional, clock, JTAG TAP pins etc.).
+* **Scan Port Identification:** Identifies which pins are `TDI`, `TDO`, `TMS`, `TCK`, `TRST`.
+* **Instruction Register Description:** Defines the JTAG instructions supported by the chip, their binary opcodes, and their lengths.
+* **Register Access Description:** Specifies which Data Register (e.g., `BOUNDARY`, `BYPASS`, `DEVICE_ID`) is connected between `TDI` and `TDO` for each instruction.
+* **Boundary Register Description:** This is often the largest part. It lists every cell in the Boundary Scan Register (BSR) chain, specifies the type of cell (e.g., input buffer observation, output buffer control), which pin(s) it relates to, and any control cells that enable/disable output buffers.
+* **Device IDCODE:** Specifies the expected 32-bit value for the IDCODE instruction.
+
+*Tools use this information to know exactly how long the scan chains are, which bits correspond to which pins, and what instruction codes to shift in.*
+
+## 12. Basic JTAG Chain Debugging Tips
+
+If a JTAG chain isn't working (e.g., tools report errors, can't find devices):
+
+* **Check Physical Connections:** Ensure the JTAG adapter is correctly wired to the board's TAP signals (`TCK`, `TMS`, `TDI`, `TDO`, GND). Check for shorts or opens.
+* **Check Power:** Ensure the target board and JTAG adapter have the correct power and voltage levels referenced.
+* **Verify TCK Signal:** Use an oscilloscope to check if `TCK` is present and clean.
+* **Check Reset:** Ensure `TRST` (if used) is in the correct state, or that the TAP controller isn't stuck in reset.
+* **Read IDCODEs:** Attempting to read IDCODEs is often the first step. If it fails, it might indicate:
+    * A break in the chain (TDO of one chip not reaching TDI of the next).
+    * A faulty device holding `TDO` low or high.
+    * Incorrect BSDL files being used by the software (leading it to expect the wrong chain length or ID).
+    * Incorrect configuration in the JTAG tool software.
+* **Isolate the Problem:** If possible, try accessing shorter segments of the chain or individual devices (if the board design allows).
+
